@@ -1,0 +1,21 @@
+name = "game-signal-tracker-api"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+workers_dev = true
+
+[vars]
+CORS_ORIGIN = "http://localhost:8000"
+IGDB_SYNC_LIMIT = "100"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "game-signal-tracker-db"
+database_id = "ade109ba-7f85-47de-9b56-a71c5bfec5dd"
+migrations_dir = "../migrations"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "52640a08490645d8abb24fd8c5c44445"
+
+[triggers]
+crons = ["0 */6 * * *"]
