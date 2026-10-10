@@ -28,6 +28,22 @@ async function handler(req,env){
     const rows=await env.DB.prepare(sql).bind(...params,limit,offset).all();
     return json({data:rows.results.map(rowGame),page,limit,source:'IGDB',forecast_status:'not_validated'},200,origin);
   }
+  if(path==='/calendar/month'){
+    const month=url.searchParams.get('month');
+    if(!/^\d{4}-(0[1-9]|1[0-2])$/.test(month||'')) return json({error:'invalid_month',hint:'Use YYYY-MM'},400,origin);
+    const [year,mon]=month.split('-').map(Number);
+    const from=Math.floor(Date.UTC(year,mon-1,1)/1000);
+    const until=Math.floor(Date.UTC(year,mon,1)/1000);
+    const platform=safeSearch(url.searchParams.get('platform'));
+    const limit=clampInt(url.searchParams.get('limit'),100,500);
+    const sql=`SELECT r.game_id,r.igdb_release_id,r.platform,r.region,r.precision,r.label,r.start_at,r.end_at,r.observed_at,g.name,g.cover_url
+      FROM release_dates r JOIN games g ON g.id=r.game_id
+      WHERE r.start_at >= ? AND r.start_at < ?
+      AND (? = '' OR r.platform LIKE ?)
+      ORDER BY r.start_at ASC,g.name ASC LIMIT ?`;
+    const rows=await env.DB.prepare(sql).bind(from,until,platform,`%${platform}%`,limit).all();
+    return json({month,source:'IGDB',date_semantics:'Observed IGDB release dates; not independently confirmed',data:rows.results,limit},200,origin);
+  }
   const match=path.match(/^\/game\/(\d+)$/);
   if(match){
     const id=Number(match[1]);
@@ -35,7 +51,9 @@ async function handler(req,env){
     if(!g)return json({error:'not_found'},404,origin);
     const releases=await env.DB.prepare('SELECT platform,region,precision,label,start_at,end_at,confirmed,observed_at FROM release_dates WHERE game_id=? ORDER BY start_at').bind(id).all();
     const history=await env.DB.prepare('SELECT previous_label,new_label,changed_at FROM date_history WHERE game_id=? ORDER BY changed_at DESC LIMIT 50').bind(id).all();
-    return json({game:rowGame(g),releases:releases.results,observed_date_changes:history.results,confirmed_date_changes:[],note:'IGDB date observations are not independently verified first-party announcements'},200,origin);
+    const observations=await env.DB.prepare('SELECT igdb_release_id,platform,region,precision,label,start_at,end_at,observed_at FROM release_observations WHERE game_id=? ORDER BY observed_at DESC LIMIT 100').bind(id).all();
+
+    return json({game:rowGame(g),releases:releases.results,observed_date_changes:history.results,release_observations:observations.results,confirmed_date_changes:[],note:'IGDB date observations are not independently verified first-party announcements'},200,origin);
   }
   if(path==='/forecasts'||path.startsWith('/forecasts/')) return json({status:'insufficient_data',probability:null,reason_codes:['MODEL_NOT_VALIDATED']},200,origin);
   if(path==='/stats'){
