@@ -37,6 +37,9 @@ export async function syncGames(env){
       if(old && old.label!==label){
         batch.push(env.DB.prepare('INSERT OR IGNORE INTO date_history(game_id,igdb_release_id,previous_label,new_label,changed_at) VALUES(?,?,?,?,?)').bind(g.id,r.id,old.label,label,now));changed++;
       }
+      // Immutable source observation, retained for future chronological validation.
+      // A repeated sync on the same second is deduplicated by the database constraint.
+      batch.push(env.DB.prepare(`INSERT OR IGNORE INTO release_observations(game_id,igdb_release_id,platform,region,precision,label,start_at,end_at,observed_at,source_id) VALUES(?,?,?,?,?,?,?,?,?,'igdb')`).bind(g.id,r.id,r.platform?.name||null,r.region==null?null:String(r.region),precision,label,start,end,now));
       batch.push(env.DB.prepare(`INSERT INTO release_dates(game_id,igdb_release_id,platform,region,precision,label,start_at,end_at,confirmed,observed_at) VALUES(?,?,?,?,?,?,?,?,0,?) ON CONFLICT(game_id,igdb_release_id) DO UPDATE SET platform=excluded.platform,region=excluded.region,precision=excluded.precision,label=excluded.label,start_at=excluded.start_at,end_at=excluded.end_at,observed_at=excluded.observed_at`).bind(g.id,r.id,r.platform?.name||null,r.region==null?null:String(r.region),precision,label,start,end,now));
     }
     await env.DB.batch(batch);stored++;
