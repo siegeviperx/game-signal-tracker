@@ -21,12 +21,8 @@ export async function igdb(env,endpoint,query){
   if(!res.ok) throw new Error(`IGDB ${endpoint} request failed: ${res.status}`);
   return res.json();
 }
-export async function syncGames(env){
-  const source=await env.DB.prepare("SELECT enabled FROM source_registry WHERE source_id='igdb'").first();
-  if(!source?.enabled) return {status:'disabled',reason:'IGDB source must pass rights review and be enabled explicitly'};
-  const now=Math.floor(Date.now()/1000);
-  const limit=Math.min(100,Math.max(1,Number(env.IGDB_SYNC_LIMIT)||100));
-  const rows=await igdb(env,'games',`fields id,slug,name,summary,cover.image_id,genres.name,platforms.name,updated_at,release_dates.id,release_dates.date,release_dates.human,release_dates.date_format,release_dates.platform.name,release_dates.region; where release_dates.date >= ${now-86400} & release_dates.date <= ${now+366*86400}; sort release_dates.date asc; limit ${limit};`);
+// Shared persistence for scheduled refresh and cursor-based backfill.
+async function storeGames(env,rows,now){
   let stored=0, changed=0;
   for(const g of rows){
     const batch=[env.DB.prepare(`INSERT INTO games(id,slug,name,summary,cover_url,genres_json,platforms_json,igdb_updated_at,synced_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET slug=excluded.slug,name=excluded.name,summary=excluded.summary,cover_url=excluded.cover_url,genres_json=excluded.genres_json,platforms_json=excluded.platforms_json,igdb_updated_at=excluded.igdb_updated_at,synced_at=excluded.synced_at`).bind(g.id,g.slug||null,g.name,g.summary||null,g.cover?.image_id?`https://images.igdb.com/igdb/image/upload/t_cover_big/${g.cover.image_id}.jpg`:null,JSON.stringify((g.genres||[]).map(x=>x.name)),JSON.stringify((g.platforms||[]).map(x=>x.name)),g.updated_at||null,now)];
@@ -44,6 +40,34 @@ export async function syncGames(env){
   }
   await env.DB.prepare('UPDATE source_registry SET last_success_at=? WHERE source_id=?').bind(now,'igdb').run();
   return {status:'ok',stored,observed_date_changes:changed,at:now};
+}
+
+export async function syncGames(env){
+  const source=await env.DB.prepare("SELECT enabled FROM source_registry WHERE source_id='igdb'").first();
+  if(!source?.enabled) return {status:'disabled',reason:'IGDB source must pass rights review and be enabled explicitly'};
+  const now=Math.floor(Date.now()/1000);
+  const limit=Math.min(100,Math.max(1,Number(env.IGDB_SYNC_LIMIT)||100));
+  const rows=await igdb(env,'games',`fields id,slug,name,summary,cover.image_id,genres.name,platforms.name,updated_at,release_dates.id,release_dates.date,release_dates.human,release_dates.date_format,release_dates.platform.name,release_dates.region; where release_dates.date >= ${now-86400} & release_dates.date <= ${now+366*86400}; sort release_dates.date asc; limit ${limit};`);
+  return storeGames(env,rows,now);
+}
+
+// Explicit admin-only keyset backfill; each call is bounded, and caller checkpoints next_cursor.
+// scope=all is expensive and deliberately never launched on a cron.
+export async function syncGamesPage(env,{cursor=0,limit=25,scope='upcoming'}={}){
+  if(!Number.isSafeInteger(cursor)||cursor<0||!Number.isSafeInteger(limit)||limit<1||limit>50||
+     !['upcoming','all'].includes(scope))throw new RangeError('invalid catalog pagination');
+  const source=await env.DB.prepare("SELECT enabled FROM source_registry WHERE source_id='igdb'").first();
+  if(!source?.enabled)return {status:'disabled',reason:'IGDB source not enabled'};
+  const now=Math.floor(Date.now()/1000);
+  const window=scope==='upcoming'?` & release_dates.date >= ${now-14*86400} & release_dates.date <= ${now+548*86400}`:'';
+  const fields='id,slug,name,summary,cover.image_id,genres.name,platforms.name,updated_at,release_dates.id,release_dates.date,release_dates.human,release_dates.date_format,release_dates.platform.name,release_dates.region';
+  const rows=await igdb(env,'games',`fields ${fields}; where id > ${cursor}${window}; sort id asc; limit ${limit};`);
+  if(!Array.isArray(rows)||rows.some(r=>!Number.isSafeInteger(r.id)||r.id<=cursor))throw new Error('IGDB invalid backfill page');
+  const result=await storeGames(env,rows,now);
+  const next=rows.at(-1)?.id??null;
+  return {...result,scope,processed:rows.length,next_cursor:rows.length===limit?next:null,
+    done:rows.length<limit,
+    note:'Cursor traversal of selected IGDB scope; repeated calls checkpoint by IGDB ID. No TBA completeness claim.'};
 }
 
 // Match every IGDB-listed Steam app to a canonical game, with stable .a/.b suffixes.

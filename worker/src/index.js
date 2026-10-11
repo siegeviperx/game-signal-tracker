@@ -1,6 +1,11 @@
 import {json,clampInt,safeSearch} from './core.js';
-import {syncGames,matchExternalIds} from './igdb.js';
+import {syncGames,syncGamesPage,matchExternalIds} from './igdb.js';
 import {collectSteamSignals,listGameSignals,exportSignals} from './signals.js';
+import {collectMultiSource} from './multisource.js';
+import {collectEditorial,listEditorialReview,reviewEditorialLink,gameEditorial} from './editorial.js';
+import {momentumDashboard} from './momentum.js';
+import {matchTwitchCategories} from './twitch-mapping.js';
+import {importVideoLinks} from './video-import.js';
 const ALLOWED=['GET','OPTIONS'];
 const rowGame=g=>({...g,genres:JSON.parse(g.genres_json||'[]'),platforms:JSON.parse(g.platforms_json||'[]'),genres_json:undefined,platforms_json:undefined,forecast:{status:'insufficient_data',probability:null,reason_codes:['MODEL_NOT_VALIDATED']}});
 function cors(req,env){const origin=req.headers.get('Origin');return origin && origin===env.CORS_ORIGIN?origin:env.CORS_ORIGIN||'*';}
@@ -24,6 +29,55 @@ async function handler(req,env){
     const params=paging(url);if(!params)return adminJson({error:'invalid_pagination',hint:'cursor nonnegative; limit 1–50'},400,origin);
     return adminJson(await matchExternalIds(env,params),200,origin);
   }
+  if(path==='/admin/match-twitch' && req.method==='POST'){
+    if(!isAdmin(req,env))return adminJson({error:'unauthorized'},401,origin);
+    const params=paging(url,{defaultLimit:20,maxLimit:25});
+    if(!params)return adminJson({error:'invalid_pagination'},400,origin);
+    return adminJson(await matchTwitchCategories(env,params),200,origin);
+  }
+  if(path==='/admin/sync-igdb-page' && req.method==='POST'){
+    if(!isAdmin(req,env))return adminJson({error:'unauthorized'},401,origin);
+    const params=paging(url,{defaultLimit:25,maxLimit:50});
+    if(!params)return adminJson({error:'invalid_pagination'},400,origin);
+    const scope=url.searchParams.get('scope')||'upcoming';
+    if(!['upcoming','all'].includes(scope))return adminJson({error:'invalid_scope'},400,origin);
+    return adminJson(await syncGamesPage(env,{...params,scope}),200,origin);
+  }
+  const multi=path.match(/^\/admin\/collect-(twitch|youtube)$/);
+  if(multi && req.method==='POST'){
+    if(!isAdmin(req,env))return adminJson({error:'unauthorized'},401,origin);
+    const params=paging(url,{defaultLimit:3,maxLimit:5});
+    if(!params)return adminJson({error:'invalid_pagination'},400,origin);
+    return adminJson(await collectMultiSource(env,{provider:multi[1],...params}),200,origin);
+  }
+  if(path==='/admin/collect-editorial' && req.method==='POST'){
+    if(!isAdmin(req,env))return adminJson({error:'unauthorized'},401,origin);
+    const params=paging(url,{defaultLimit:2,maxLimit:3});
+    if(!params)return adminJson({error:'invalid_pagination'},400,origin);
+    return adminJson(await collectEditorial(env,params),200,origin);
+  }
+  if(path==='/admin/import-videos' && req.method==='POST'){
+    if(!isAdmin(req,env))return adminJson({error:'unauthorized'},401,origin);
+    if(Number(req.headers.get('Content-Length')||'0')>16000)return adminJson({error:'body_too_large'},413,origin);
+    const raw=await req.text();if(raw.length>16000)return adminJson({error:'body_too_large'},413,origin);
+    let body;try{body=JSON.parse(raw);}catch{return adminJson({error:'invalid_json'},400,origin);}
+    const result=await importVideoLinks(env,body?.videos);
+    return adminJson(result,result.error?400:200,origin);
+  }
+  if(path==='/admin/editorial-review' && req.method==='GET'){
+    if(!isAdmin(req,env))return adminJson({error:'unauthorized'},401,origin);
+    const params=paging(url,{defaultLimit:25,maxLimit:50});
+    if(!params)return adminJson({error:'invalid_pagination'},400,origin);
+    return adminJson(await listEditorialReview(env,params),200,origin);
+  }
+  if(path==='/admin/editorial-review' && req.method==='POST'){
+    if(!isAdmin(req,env))return adminJson({error:'unauthorized'},401,origin);
+    if(Number(req.headers.get('Content-Length')||'0')>4096)return adminJson({error:'body_too_large'},413,origin);
+    const raw=await req.text();if(raw.length>4096)return adminJson({error:'body_too_large'},413,origin);
+    let data;try{data=JSON.parse(raw);}catch{return adminJson({error:'invalid_json'},400,origin);}
+    const result=await reviewEditorialLink(env,{articleId:data.article_id,gameId:data.game_id,decision:data.decision});
+    return adminJson(result,result.error?400:200,origin);
+  }
   if(path==='/admin/collect-steam-signals' && req.method==='POST'){
     if(!isAdmin(req,env))return adminJson({error:'unauthorized'},401,origin);
     const params=paging(url,{defaultLimit:5,maxLimit:5});
@@ -42,6 +96,22 @@ async function handler(req,env){
     const signalSrc=await env.DB.prepare('SELECT enabled,rights_status,last_success_at FROM signal_source_registry WHERE source_id=?').bind('steam_current_players').first();
     return json({status:src?.enabled?'operational':'setup_required',igdb:src||null,
       signal_sources:{steam_current_players:signalSrc||null},forecast_status:'not_validated'},200,origin);
+  }
+  if(path==='/sources'){
+    const rows=await env.DB.prepare(`SELECT source_id,provider,description,enabled,rights_status,
+      last_success_at,last_failure_at FROM signal_source_registry ORDER BY source_id`).all();
+    return json({sources:rows.results,warning:'Approval is source-specific; enabled does not establish data coverage.'},200,origin);
+  }
+  if(path==='/trending'){
+    const limit=clampInt(url.searchParams.get('limit'),20,100);
+    return json(await momentumDashboard(env,{limit}),200,origin);
+  }
+  const news=path.match(/^\/game\/(\d+)\/news$/);
+  if(news){
+    const id=Number(news[1]);
+    const g=await env.DB.prepare('SELECT id FROM games WHERE id=?').bind(id).first();
+    if(!g)return json({error:'not_found'},404,origin);
+    return json(await gameEditorial(env,id,{limit:clampInt(url.searchParams.get('limit'),25,100)}),200,origin);
   }
   if(path==='/games'||path==='/calendar'){
     const limit=clampInt(url.searchParams.get('limit'),24,100),page=clampInt(url.searchParams.get('page'),1,1000),offset=(page-1)*limit;
@@ -117,5 +187,19 @@ export default {
       const result=await collectSteamSignals(env,{cursor:Number.isSafeInteger(cursor)?cursor:0,limit:5});
       if(result.status==='ok')await env.CACHE.put(key,String(result.done?0:result.next_cursor));
     })().catch(e=>console.error('steam_collection_failed',e?.message)));
+    for(const [provider,flag,limit] of [['twitch','TWITCH_COLLECTION_ENABLED',2],['youtube','YOUTUBE_COLLECTION_ENABLED',2]]){
+      if(env[flag]!=='true')continue;
+      ctx.waitUntil((async()=>{
+        const key=`gst:c2:cursor:${provider}`;
+        const cursor=Number(await env.CACHE.get(key)||0);
+        const result=await collectMultiSource(env,{provider,cursor:Number.isSafeInteger(cursor)?cursor:0,limit});
+        if(result.status==='ok')await env.CACHE.put(key,String(result.done?0:result.next_cursor));
+      })().catch(()=>console.error('multisource_collection_failed',provider)));
+    }
+    if(env.EDITORIAL_COLLECTION_ENABLED==='true')ctx.waitUntil((async()=>{
+      const key='gst:c2:cursor:editorial',cursor=Number(await env.CACHE.get(key)||0);
+      const result=await collectEditorial(env,{cursor:Number.isSafeInteger(cursor)?cursor:0,limit:1});
+      if(result.status==='ok')await env.CACHE.put(key,String(result.done?0:result.next_cursor));
+    })().catch(()=>console.error('editorial_collection_failed')));
   }
 };
