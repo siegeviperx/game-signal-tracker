@@ -47,6 +47,7 @@ export async function syncGames(env){
 
 // Process a bounded page of existing D1 games; repeat using next_cursor until done.
 // Never infer Steam IDs from game names, and never overwrite an existing mapping.
+// Diagnostic details are returned for conflicts and unmatched games; no schema changes.
 export async function matchExternalIds(env,{cursor=0,limit=20}={}){
   const source=await env.DB.prepare("SELECT enabled FROM source_registry WHERE source_id='igdb'").first();
   if(!source?.enabled) return {status:'disabled',reason:'IGDB source is not enabled'};
@@ -55,7 +56,7 @@ export async function matchExternalIds(env,{cursor=0,limit=20}={}){
 
   const page=await env.DB.prepare('SELECT id FROM games WHERE id > ? ORDER BY id ASC LIMIT ?').bind(cursor,limit).all();
   const ids=page.results.map(row=>row.id);
-  if(!ids.length) return {status:'ok',processed:0,matched:0,already_mapped:0,conflicts:0,unmatched:0,next_cursor:null,done:true};
+  if(!ids.length) return {status:'ok',processed:0,matched:0,already_mapped:0,conflicts:0,unmatched:0,conflict_details:[],unmatched_details:[],next_cursor:null,done:true};
 
   // Resolve source IDs from the live IGDB registry; do not rely on deprecated category numbers.
   const sources=await igdb(env,'external_game_sources','fields id,name; limit 500;');
@@ -75,23 +76,44 @@ export async function matchExternalIds(env,{cursor=0,limit=20}={}){
   }
 
   let matched=0,alreadyMapped=0,conflicts=0,unmatched=0;
+  const conflictDetails=[];
+  const unmatchedDetails=[];
   for(const id of ids){
     const choices=[...(candidates.get(id)||[])];
-    if(!choices.length){unmatched++;continue;}
+    if(!choices.length){
+      unmatched++;
+      unmatchedDetails.push({game_id:id,reason:'no_usable_steam_id_in_igdb'});
+      continue;
+    }
     // Multiple Steam editions may map to one IGDB game. Do not guess which is canonical.
-    if(choices.length!==1){conflicts++;continue;}
+    if(choices.length!==1){
+      conflicts++;
+      conflictDetails.push({game_id:id,reason:'multiple_steam_ids',steam_ids:choices});
+      continue;
+    }
     const uid=choices[0];
     const existing=await env.DB.prepare('SELECT game_id,external_id FROM external_game_ids WHERE provider=? AND (game_id=? OR external_id=?)').bind('steam',id,uid).all();
-    if(existing.results.some(r=>r.game_id!==id||r.external_id!==uid)){conflicts++;continue;}
+    const collisions=existing.results.filter(r=>r.game_id!==id||r.external_id!==uid);
+    if(collisions.length){
+      conflicts++;
+      conflictDetails.push({game_id:id,reason:'existing_mapping_collision',steam_ids:[uid],existing_mappings:collisions});
+      continue;
+    }
     if(existing.results.some(r=>r.game_id===id&&r.external_id===uid)){alreadyMapped++;continue;}
     // IGDB-provided ID is a candidate until validated against Steam's official listing.
     const result=await env.DB.prepare(`INSERT OR IGNORE INTO external_game_ids
       (game_id,provider,external_id,match_status,match_method,verified_at)
       VALUES (?,'steam',?,'candidate','igdb_external_games',NULL)`).bind(id,uid).run();
-    if(result.meta?.changes===1) matched++;else conflicts++;
+    if(result.meta?.changes===1) matched++;
+    else {
+      conflicts++;
+      conflictDetails.push({game_id:id,reason:'insert_ignored',steam_ids:[uid]});
+    }
   }
   const nextCursor=ids[ids.length-1];
   const more=await env.DB.prepare('SELECT id FROM games WHERE id > ? LIMIT 1').bind(nextCursor).first();
-  return {status:'ok',processed:ids.length,matched,already_mapped:alreadyMapped,conflicts,unmatched,next_cursor:more?nextCursor:null,done:!more,
+  return {status:'ok',processed:ids.length,matched,already_mapped:alreadyMapped,conflicts,unmatched,
+    conflict_details:conflictDetails,unmatched_details:unmatchedDetails,
+    next_cursor:more?nextCursor:null,done:!more,
     note:'IGDB-sourced Steam IDs are candidates, not independently verified. Conflicts and multiple editions require review.'};
 }
