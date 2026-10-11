@@ -1,28 +1,47 @@
 import {json,clampInt,safeSearch} from './core.js';
 import {syncGames,matchExternalIds} from './igdb.js';
+import {collectSteamSignals,listGameSignals,exportSignals} from './signals.js';
 const ALLOWED=['GET','OPTIONS'];
 const rowGame=g=>({...g,genres:JSON.parse(g.genres_json||'[]'),platforms:JSON.parse(g.platforms_json||'[]'),genres_json:undefined,platforms_json:undefined,forecast:{status:'insufficient_data',probability:null,reason_codes:['MODEL_NOT_VALIDATED']}});
 function cors(req,env){const origin=req.headers.get('Origin');return origin && origin===env.CORS_ORIGIN?origin:env.CORS_ORIGIN||'*';}
+function isAdmin(req,env){return !!env.ADMIN_TOKEN&&req.headers.get('Authorization')===`Bearer ${env.ADMIN_TOKEN}`;}
+function adminJson(data,status,origin){const response=json(data,status,origin);response.headers.set('Cache-Control','no-store, private');return response;}
+function paging(url,{defaultLimit=20,maxLimit=50}={}){
+  const cursorRaw=url.searchParams.get('cursor')||'0',limitRaw=url.searchParams.get('limit')||String(defaultLimit);
+  if(!/^\d+$/.test(cursorRaw)||!/^[1-9]\d*$/.test(limitRaw)||!Number.isSafeInteger(Number(cursorRaw))||!Number.isSafeInteger(Number(limitRaw))||Number(limitRaw)>maxLimit) return null;
+  return {cursor:Number(cursorRaw),limit:Number(limitRaw)};
+}
 async function handler(req,env){
   const url=new URL(req.url),path=url.pathname.replace(/\/$/,'')||'/';
   const origin=cors(req,env);
   if(req.method==='OPTIONS') return new Response(null,{status:204,headers:{'Access-Control-Allow-Origin':origin,'Access-Control-Allow-Methods':'GET,POST,OPTIONS','Access-Control-Allow-Headers':'Authorization,Content-Type'}});
   if(path==='/admin/sync-igdb' && req.method==='POST'){
-    if(!env.ADMIN_TOKEN||req.headers.get('Authorization')!==`Bearer ${env.ADMIN_TOKEN}`) return json({error:'unauthorized'},401,origin);
-    return json(await syncGames(env),200,origin);
+    if(!isAdmin(req,env))return adminJson({error:'unauthorized'},401,origin);
+    return adminJson(await syncGames(env),200,origin);
   }
   if(path==='/admin/match-external-ids' && req.method==='POST'){
-    if(!env.ADMIN_TOKEN||req.headers.get('Authorization')!==`Bearer ${env.ADMIN_TOKEN}`) return json({error:'unauthorized'},401,origin);
-    const cursorRaw=url.searchParams.get('cursor')||'0';
-    const limitRaw=url.searchParams.get('limit')||'20';
-    if(!/^\d+$/.test(cursorRaw)||!/^\d+$/.test(limitRaw)||!Number.isSafeInteger(Number(cursorRaw))||Number(limitRaw)<1||Number(limitRaw)>50)
-      return json({error:'invalid_pagination',hint:'cursor must be a nonnegative integer; limit 1–50'},400,origin);
-    return json(await matchExternalIds(env,{cursor:Number(cursorRaw),limit:Number(limitRaw)}),200,origin);
+    if(!isAdmin(req,env))return adminJson({error:'unauthorized'},401,origin);
+    const params=paging(url);if(!params)return adminJson({error:'invalid_pagination',hint:'cursor nonnegative; limit 1–50'},400,origin);
+    return adminJson(await matchExternalIds(env,params),200,origin);
   }
-  if(!ALLOWED.includes(req.method)) return json({error:'method_not_allowed'},405,origin);
+  if(path==='/admin/collect-steam-signals' && req.method==='POST'){
+    if(!isAdmin(req,env))return adminJson({error:'unauthorized'},401,origin);
+    const params=paging(url,{defaultLimit:5,maxLimit:5});
+    if(!params)return adminJson({error:'invalid_pagination',hint:'cursor nonnegative; limit 1–5'},400,origin);
+    return adminJson(await collectSteamSignals(env,params),200,origin);
+  }
+  if(path==='/admin/export-signals' && req.method==='GET'){
+    if(!isAdmin(req,env))return adminJson({error:'unauthorized'},401,origin);
+    const params=paging(url,{defaultLimit:200,maxLimit:500});
+    if(!params)return adminJson({error:'invalid_pagination',hint:'cursor nonnegative; limit 1–500'},400,origin);
+    return adminJson(await exportSignals(env,params),200,origin);
+  }
+  if(!ALLOWED.includes(req.method))return json({error:'method_not_allowed'},405,origin);
   if(path==='/health'){
     const src=await env.DB.prepare('SELECT enabled,rights_status,last_success_at FROM source_registry WHERE source_id=?').bind('igdb').first();
-    return json({status:src?.enabled?'operational':'setup_required',igdb:src||null,forecast_status:'not_validated'},200,origin);
+    const signalSrc=await env.DB.prepare('SELECT enabled,rights_status,last_success_at FROM signal_source_registry WHERE source_id=?').bind('steam_current_players').first();
+    return json({status:src?.enabled?'operational':'setup_required',igdb:src||null,
+      signal_sources:{steam_current_players:signalSrc||null},forecast_status:'not_validated'},200,origin);
   }
   if(path==='/games'||path==='/calendar'){
     const limit=clampInt(url.searchParams.get('limit'),24,100),page=clampInt(url.searchParams.get('page'),1,1000),offset=(page-1)*limit;
@@ -38,7 +57,7 @@ async function handler(req,env){
   }
   if(path==='/calendar/month'){
     const month=url.searchParams.get('month');
-    if(!/^\d{4}-(0[1-9]|1[0-2])$/.test(month||'')) return json({error:'invalid_month',hint:'Use YYYY-MM'},400,origin);
+    if(!/^\d{4}-(0[1-9]|1[0-2])$/.test(month||''))return json({error:'invalid_month',hint:'Use YYYY-MM'},400,origin);
     const [year,mon]=month.split('-').map(Number);
     const from=Math.floor(Date.UTC(year,mon-1,1)/1000);
     const until=Math.floor(Date.UTC(year,mon,1)/1000);
@@ -52,6 +71,23 @@ async function handler(req,env){
     const rows=await env.DB.prepare(sql).bind(from,until,platform,`%${platform}%`,limit).all();
     return json({month,source:'IGDB',date_semantics:'Observed IGDB release dates; not independently confirmed',data:rows.results,limit},200,origin);
   }
+  const signals=path.match(/^\/game\/(\d+)\/signals$/);
+  if(signals){
+    const id=Number(signals[1]);
+    const g=await env.DB.prepare('SELECT id FROM games WHERE id=?').bind(id).first();
+    if(!g)return json({error:'not_found'},404,origin);
+    return json(await listGameSignals(env,id,{limit:clampInt(url.searchParams.get('limit'),100,500)}),200,origin);
+  }
+  const variants=path.match(/^\/game\/(\d+)\/variants$/);
+  if(variants){
+    const id=Number(variants[1]);
+    const g=await env.DB.prepare('SELECT id FROM games WHERE id=?').bind(id).first();
+    if(!g)return json({error:'not_found'},404,origin);
+    const r=await env.DB.prepare(`SELECT provider,external_id,variant_code,match_status,match_method,verified_at
+      FROM external_game_ids WHERE game_id=? ORDER BY variant_code,provider`).bind(id).all();
+    return json({game_id:id,variants:r.results.map(e=>({...e,designation:`${id}.${e.variant_code||'unassigned'}`})),
+      note:'Designations are internal labels; candidate IDs are not independently verified.'},200,origin);
+  }
   const match=path.match(/^\/game\/(\d+)$/);
   if(match){
     const id=Number(match[1]);
@@ -62,13 +98,24 @@ async function handler(req,env){
     const observations=await env.DB.prepare('SELECT igdb_release_id,platform,region,precision,label,start_at,end_at,observed_at FROM release_observations WHERE game_id=? ORDER BY observed_at DESC LIMIT 100').bind(id).all();
     return json({game:rowGame(g),releases:releases.results,observed_date_changes:history.results,release_observations:observations.results,confirmed_date_changes:[],note:'IGDB date observations are not independently verified first-party announcements'},200,origin);
   }
-  if(path==='/forecasts'||path.startsWith('/forecasts/')) return json({status:'insufficient_data',probability:null,reason_codes:['MODEL_NOT_VALIDATED']},200,origin);
+  if(path==='/forecasts'||path.startsWith('/forecasts/'))return json({status:'insufficient_data',probability:null,reason_codes:['MODEL_NOT_VALIDATED']},200,origin);
   if(path==='/stats'){
-    const r=await env.DB.prepare('SELECT COUNT(*) AS games FROM games').first();return json({games:r.games,forecast_status:'not_validated'},200,origin);
+    const r=await env.DB.prepare('SELECT COUNT(*) AS games FROM games').first();
+    const s=await env.DB.prepare('SELECT COUNT(*) AS observations, COUNT(DISTINCT game_id) AS games_with_signals FROM signal_observations').first();
+    return json({games:r.games,observations:s.observations,games_with_signals:s.games_with_signals,forecast_status:'not_validated'},200,origin);
   }
   return json({error:'not_found'},404,origin);
 }
 export default {
   async fetch(req,env){try{return await handler(req,env);}catch(e){console.error('request_failed',e?.message);return json({error:'service_unavailable'},503,env.CORS_ORIGIN||'*');}},
-  async scheduled(event,env,ctx){ctx.waitUntil(syncGames(env).catch(e=>console.error('sync_failed',e?.message)));}
+  async scheduled(event,env,ctx){
+    ctx.waitUntil(syncGames(env).catch(e=>console.error('sync_failed',e?.message)));
+    // Explicit double opt-in: config flag AND source rights approval. Default remains disabled.
+    if(env.STEAM_COLLECTION_ENABLED==='true') ctx.waitUntil((async()=>{
+      const key='gst:steam:collection_cursor';
+      const cursor=Number(await env.CACHE.get(key)||0);
+      const result=await collectSteamSignals(env,{cursor:Number.isSafeInteger(cursor)?cursor:0,limit:5});
+      if(result.status==='ok')await env.CACHE.put(key,String(result.done?0:result.next_cursor));
+    })().catch(e=>console.error('steam_collection_failed',e?.message)));
+  }
 };
