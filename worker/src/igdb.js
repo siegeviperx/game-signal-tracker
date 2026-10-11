@@ -33,12 +33,9 @@ export async function syncGames(env){
       const {precision,label}=precisionLabel(r.date_format,r.date,r.human);
       const [start,end]=releaseRange(r.date_format,r.date);
       const old=await env.DB.prepare('SELECT label FROM release_dates WHERE game_id=? AND igdb_release_id=?').bind(g.id,r.id).first();
-      // IGDB metadata alone does not establish primary-source confirmation.
       if(old && old.label!==label){
         batch.push(env.DB.prepare('INSERT OR IGNORE INTO date_history(game_id,igdb_release_id,previous_label,new_label,changed_at) VALUES(?,?,?,?,?)').bind(g.id,r.id,old.label,label,now));changed++;
       }
-      // Immutable source observation, retained for future chronological validation.
-      // A repeated sync on the same second is deduplicated by the database constraint.
       batch.push(env.DB.prepare(`INSERT OR IGNORE INTO release_observations(game_id,igdb_release_id,platform,region,precision,label,start_at,end_at,observed_at,source_id) VALUES(?,?,?,?,?,?,?,?,?,'igdb')`).bind(g.id,r.id,r.platform?.name||null,r.region==null?null:String(r.region),precision,label,start,end,now));
       batch.push(env.DB.prepare(`INSERT INTO release_dates(game_id,igdb_release_id,platform,region,precision,label,start_at,end_at,confirmed,observed_at) VALUES(?,?,?,?,?,?,?,?,0,?) ON CONFLICT(game_id,igdb_release_id) DO UPDATE SET platform=excluded.platform,region=excluded.region,precision=excluded.precision,label=excluded.label,start_at=excluded.start_at,end_at=excluded.end_at,observed_at=excluded.observed_at`).bind(g.id,r.id,r.platform?.name||null,r.region==null?null:String(r.region),precision,label,start,end,now));
     }
@@ -46,4 +43,55 @@ export async function syncGames(env){
   }
   await env.DB.prepare('UPDATE source_registry SET last_success_at=? WHERE source_id=?').bind(now,'igdb').run();
   return {status:'ok',stored,observed_date_changes:changed,at:now};
+}
+
+// Process a bounded page of existing D1 games; repeat using next_cursor until done.
+// Never infer Steam IDs from game names, and never overwrite an existing mapping.
+export async function matchExternalIds(env,{cursor=0,limit=20}={}){
+  const source=await env.DB.prepare("SELECT enabled FROM source_registry WHERE source_id='igdb'").first();
+  if(!source?.enabled) return {status:'disabled',reason:'IGDB source is not enabled'};
+  if(!Number.isSafeInteger(cursor)||cursor<0||!Number.isSafeInteger(limit)||limit<1||limit>50)
+    throw new RangeError('Invalid cursor or limit');
+
+  const page=await env.DB.prepare('SELECT id FROM games WHERE id > ? ORDER BY id ASC LIMIT ?').bind(cursor,limit).all();
+  const ids=page.results.map(row=>row.id);
+  if(!ids.length) return {status:'ok',processed:0,matched:0,already_mapped:0,conflicts:0,unmatched:0,next_cursor:null,done:true};
+
+  // Resolve source IDs from the live IGDB registry; do not rely on deprecated category numbers.
+  const sources=await igdb(env,'external_game_sources','fields id,name; limit 500;');
+  const steamSourceIds=new Set(sources.filter(s=>/^steam$/i.test((s.name||'').trim())).map(s=>s.id));
+  if(!steamSourceIds.size) return {status:'source_unresolved',reason:'No Steam provider found in IGDB external_game_sources; no mappings written',processed:0,next_cursor:cursor,done:false};
+
+  const external=await igdb(env,'external_games',`fields id,game,uid,external_game_source,url; where game = (${ids.join(',')}); limit 500;`);
+  const candidates=new Map();
+  for(const item of external){
+    const gameId=typeof item.game==='object'?item.game?.id:item.game;
+    const providerId=typeof item.external_game_source==='object'?item.external_game_source?.id:item.external_game_source;
+    if(!ids.includes(gameId)||!steamSourceIds.has(providerId)) continue;
+    const uid=String(item.uid??'').trim();
+    if(!/^\d+$/.test(uid)) continue;
+    if(!candidates.has(gameId)) candidates.set(gameId,new Set());
+    candidates.get(gameId).add(uid);
+  }
+
+  let matched=0,alreadyMapped=0,conflicts=0,unmatched=0;
+  for(const id of ids){
+    const choices=[...(candidates.get(id)||[])];
+    if(!choices.length){unmatched++;continue;}
+    // Multiple Steam editions may map to one IGDB game. Do not guess which is canonical.
+    if(choices.length!==1){conflicts++;continue;}
+    const uid=choices[0];
+    const existing=await env.DB.prepare('SELECT game_id,external_id FROM external_game_ids WHERE provider=? AND (game_id=? OR external_id=?)').bind('steam',id,uid).all();
+    if(existing.results.some(r=>r.game_id!==id||r.external_id!==uid)){conflicts++;continue;}
+    if(existing.results.some(r=>r.game_id===id&&r.external_id===uid)){alreadyMapped++;continue;}
+    // IGDB-provided ID is a candidate until validated against Steam's official listing.
+    const result=await env.DB.prepare(`INSERT OR IGNORE INTO external_game_ids
+      (game_id,provider,external_id,match_status,match_method,verified_at)
+      VALUES (?,'steam',?,'candidate','igdb_external_games',NULL)`).bind(id,uid).run();
+    if(result.meta?.changes===1) matched++;else conflicts++;
+  }
+  const nextCursor=ids[ids.length-1];
+  const more=await env.DB.prepare('SELECT id FROM games WHERE id > ? LIMIT 1').bind(nextCursor).first();
+  return {status:'ok',processed:ids.length,matched,already_mapped:alreadyMapped,conflicts,unmatched,next_cursor:more?nextCursor:null,done:!more,
+    note:'IGDB-sourced Steam IDs are candidates, not independently verified. Conflicts and multiple editions require review.'};
 }

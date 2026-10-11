@@ -1,5 +1,5 @@
 import {json,clampInt,safeSearch} from './core.js';
-import {syncGames} from './igdb.js';
+import {syncGames,matchExternalIds} from './igdb.js';
 const ALLOWED=['GET','OPTIONS'];
 const rowGame=g=>({...g,genres:JSON.parse(g.genres_json||'[]'),platforms:JSON.parse(g.platforms_json||'[]'),genres_json:undefined,platforms_json:undefined,forecast:{status:'insufficient_data',probability:null,reason_codes:['MODEL_NOT_VALIDATED']}});
 function cors(req,env){const origin=req.headers.get('Origin');return origin && origin===env.CORS_ORIGIN?origin:env.CORS_ORIGIN||'*';}
@@ -10,6 +10,14 @@ async function handler(req,env){
   if(path==='/admin/sync-igdb' && req.method==='POST'){
     if(!env.ADMIN_TOKEN||req.headers.get('Authorization')!==`Bearer ${env.ADMIN_TOKEN}`) return json({error:'unauthorized'},401,origin);
     return json(await syncGames(env),200,origin);
+  }
+  if(path==='/admin/match-external-ids' && req.method==='POST'){
+    if(!env.ADMIN_TOKEN||req.headers.get('Authorization')!==`Bearer ${env.ADMIN_TOKEN}`) return json({error:'unauthorized'},401,origin);
+    const cursorRaw=url.searchParams.get('cursor')||'0';
+    const limitRaw=url.searchParams.get('limit')||'20';
+    if(!/^\d+$/.test(cursorRaw)||!/^\d+$/.test(limitRaw)||!Number.isSafeInteger(Number(cursorRaw))||Number(limitRaw)<1||Number(limitRaw)>50)
+      return json({error:'invalid_pagination',hint:'cursor must be a nonnegative integer; limit 1–50'},400,origin);
+    return json(await matchExternalIds(env,{cursor:Number(cursorRaw),limit:Number(limitRaw)}),200,origin);
   }
   if(!ALLOWED.includes(req.method)) return json({error:'method_not_allowed'},405,origin);
   if(path==='/health'){
@@ -52,7 +60,6 @@ async function handler(req,env){
     const releases=await env.DB.prepare('SELECT platform,region,precision,label,start_at,end_at,confirmed,observed_at FROM release_dates WHERE game_id=? ORDER BY start_at').bind(id).all();
     const history=await env.DB.prepare('SELECT previous_label,new_label,changed_at FROM date_history WHERE game_id=? ORDER BY changed_at DESC LIMIT 50').bind(id).all();
     const observations=await env.DB.prepare('SELECT igdb_release_id,platform,region,precision,label,start_at,end_at,observed_at FROM release_observations WHERE game_id=? ORDER BY observed_at DESC LIMIT 100').bind(id).all();
-
     return json({game:rowGame(g),releases:releases.results,observed_date_changes:history.results,release_observations:observations.results,confirmed_date_changes:[],note:'IGDB date observations are not independently verified first-party announcements'},200,origin);
   }
   if(path==='/forecasts'||path.startsWith('/forecasts/')) return json({status:'insufficient_data',probability:null,reason_codes:['MODEL_NOT_VALIDATED']},200,origin);
