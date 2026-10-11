@@ -14,7 +14,10 @@ $('search-form').addEventListener('submit',async event=>{
   } catch(e){$('feedback').textContent=`Search unavailable: ${e.message}`;}
 });
 $('choose-form').addEventListener('submit',event=>{event.preventDefault();const id=$('game-choice').value;if(id)loadGame(id);});
+let latestRows=[];
 function draw(rows){
+  const selected=$('signal-metric').value;
+  rows=rows.filter(r=>`${r.source_id}|${r.metric}|${r.unit}`===selected);
   const canvas=$('signal-chart'),ctx=canvas.getContext('2d');
   const W=canvas.width,H=canvas.height;ctx.clearRect(0,0,W,H);
   ctx.strokeStyle='#344962';ctx.lineWidth=1;
@@ -39,18 +42,26 @@ function draw(rows){
 async function loadGame(id){
   $('feedback').textContent='Loading observed records…';
   try{
-    const [detail,variants,signals]=await Promise.all([api('/game/'+id),api('/game/'+id+'/variants'),api('/game/'+id+'/signals?limit=500')]);
+    const [detail,variants,signals,news]=await Promise.all([api('/game/'+id),api('/game/'+id+'/variants'),api('/game/'+id+'/signals?limit=500'),api('/game/'+id+'/news')]);
     $('profile').hidden=false;$('game-title').textContent=detail.game.name;
     $('variant-rows').replaceChildren();
     for(const v of variants.variants){const tr=document.createElement('tr');
       for(const s of [v.designation,v.provider,v.external_id,v.match_status])addCell(tr,s);$('variant-rows').append(tr);}
     $('signal-rows').replaceChildren();
     for(const r of signals.rows){const tr=document.createElement('tr');
-      for(const s of [r.day_utc,r.variant_code?`${id}.${r.variant_code}`:'Canonical game',r.metric,fmt(r.value_last),fmt(r.value_max),r.observed_count,r.missing_count])addCell(tr,s);
+      for(const s of [r.day_utc,r.variant_code?`${id}.${r.variant_code}`:'Canonical game',r.source_id,r.metric,fmt(r.value_last),fmt(r.value_max),r.observed_count,r.missing_count])addCell(tr,s);
       $('signal-rows').append(tr);}
+    $('news-rows').replaceChildren();
+    for(const article of news.articles||[]){const tr=document.createElement('tr'),td=document.createElement('td'),a=document.createElement('a');a.href=article.url;a.textContent=article.title;a.target='_blank';a.rel='noopener noreferrer';td.append(a);tr.append(td);addCell(tr,article.publisher);addCell(tr,article.published_at?new Date(article.published_at*1000).toLocaleDateString():'Unspecified');$('news-rows').append(tr);}
+    $('news-note').textContent=(news.articles||[]).length?`${news.articles.length} reviewed game-linked articles (not independently validated release claims).`:'No reviewed article links yet.';
     $('signal-note').textContent=signals.rows.length?`${signals.rows.length} variant/day records. Sampled maximum is not a full daily peak; IDs marked candidate require validation.`:'No signal history yet. Source approval and collection are separate operational steps.';
+    latestRows=signals.rows;
+    const metricSelect=$('signal-metric');metricSelect.replaceChildren();
+    const unique=[...new Set(signals.rows.map(r=>`${r.source_id}|${r.metric}|${r.unit}`))];
+    for(const metric of unique){const opt=document.createElement('option');opt.value=metric;opt.textContent=metric.split('|').join(' · ');metricSelect.append(opt);}
     $('feedback').textContent=`Loaded ${variants.variants.length} external listings, ${signals.rows.length} daily observations.`;draw(signals.rows);
   }catch(e){$('feedback').textContent=`Could not load game signals: ${e.message}`;}
 }
+$('signal-metric').addEventListener('change',()=>draw(latestRows));
 const preselected=new URLSearchParams(location.search).get('game');
 if(preselected&&/^\d+$/.test(preselected))loadGame(preselected);
